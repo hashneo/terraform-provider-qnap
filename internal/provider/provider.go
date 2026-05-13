@@ -13,6 +13,7 @@ import (
 
 	"github.com/steventaylor/terraform-provider-qnap/internal/client"
 	"github.com/steventaylor/terraform-provider-qnap/internal/datasources"
+	"github.com/steventaylor/terraform-provider-qnap/internal/resources"
 )
 
 var _ provider.Provider = (*QNAPProvider)(nil)
@@ -103,8 +104,11 @@ func (p *QNAPProvider) Configure(ctx context.Context, req provider.ConfigureRequ
 }
 
 func (p *QNAPProvider) Resources(_ context.Context) []func() resource.Resource {
-	// Read-only provider for now — inventory only.
-	return []func() resource.Resource{}
+	return []func() resource.Resource{
+		resources.NewSharedFolderResource,
+		resources.NewISCSITargetResource,
+		resources.NewISCSILunResource,
+	}
 }
 
 func (p *QNAPProvider) DataSources(_ context.Context) []func() datasource.DataSource {

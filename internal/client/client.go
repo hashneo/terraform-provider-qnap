@@ -1001,6 +1001,431 @@ func (c *Client) Projects() ([]Project, error) {
 	return []Project{}, nil
 }
 
+// -----------------------------------------------------------------------
+// Write methods — SharedFolder
+// -----------------------------------------------------------------------
+
+// SharedFolderCreateInput holds the parameters for creating a shared folder.
+type SharedFolderCreateInput struct {
+	Name        string
+	VolumeID    string // e.g. "CACHEDEV1_DATA"
+	Comment     string
+	Compression bool
+	Hidden      bool
+	ReadOnly    bool
+}
+
+// SharedFolderUpdateInput holds the mutable fields for an existing shared folder.
+type SharedFolderUpdateInput struct {
+	Name        string // used to identify the folder
+	Comment     string
+	Compression bool
+	Hidden      bool
+	ReadOnly    bool
+}
+
+// CreateSharedFolder creates a new shared folder via the File Station CGI.
+func (c *Client) CreateSharedFolder(input SharedFolderCreateInput) error {
+	q := url.Values{}
+	q.Set("func", "add_share")
+
+	q.Set("sharename", input.Name)
+	if input.VolumeID != "" {
+		q.Set("vol_no", input.VolumeID)
+	}
+	if input.Comment != "" {
+		q.Set("comment", input.Comment)
+	}
+	if input.Compression {
+		q.Set("compress", "1")
+	} else {
+		q.Set("compress", "0")
+	}
+	if input.Hidden {
+		q.Set("hidden", "1")
+	} else {
+		q.Set("hidden", "0")
+	}
+	if input.ReadOnly {
+		q.Set("readonly", "1")
+	} else {
+		q.Set("readonly", "0")
+	}
+
+	var resp struct {
+		Status int `json:"status"`
+	}
+	if err := c.fileStationJSON(q, &resp); err != nil {
+		return fmt.Errorf("qnap CreateSharedFolder: %w", err)
+	}
+	if resp.Status != 1 {
+		return fmt.Errorf("qnap CreateSharedFolder: unexpected status %d", resp.Status)
+	}
+	return nil
+}
+
+// UpdateSharedFolder updates a shared folder's mutable attributes.
+func (c *Client) UpdateSharedFolder(input SharedFolderUpdateInput) error {
+	q := url.Values{}
+	q.Set("func", "edit_share")
+	q.Set("sharename", input.Name)
+	q.Set("comment", input.Comment)
+	if input.Compression {
+		q.Set("compress", "1")
+	} else {
+		q.Set("compress", "0")
+	}
+	if input.Hidden {
+		q.Set("hidden", "1")
+	} else {
+		q.Set("hidden", "0")
+	}
+	if input.ReadOnly {
+		q.Set("readonly", "1")
+	} else {
+		q.Set("readonly", "0")
+	}
+
+	var resp struct {
+		Status int `json:"status"`
+	}
+	if err := c.fileStationJSON(q, &resp); err != nil {
+		return fmt.Errorf("qnap UpdateSharedFolder: %w", err)
+	}
+	if resp.Status != 1 {
+		return fmt.Errorf("qnap UpdateSharedFolder: unexpected status %d", resp.Status)
+	}
+	return nil
+}
+
+// DeleteSharedFolder removes a shared folder by name.
+func (c *Client) DeleteSharedFolder(name string) error {
+	q := url.Values{}
+	q.Set("func", "delete_share")
+	q.Set("sharename", name)
+
+	var resp struct {
+		Status int `json:"status"`
+	}
+	if err := c.fileStationJSON(q, &resp); err != nil {
+		return fmt.Errorf("qnap DeleteSharedFolder: %w", err)
+	}
+	if resp.Status != 1 {
+		return fmt.Errorf("qnap DeleteSharedFolder: unexpected status %d", resp.Status)
+	}
+	return nil
+}
+
+// -----------------------------------------------------------------------
+// Write methods — ISCSITarget
+// -----------------------------------------------------------------------
+
+// ISCSITargetCreateInput holds parameters for creating an iSCSI target.
+type ISCSITargetCreateInput struct {
+	Name    string
+	Alias   string
+	IQN     string // optional; if empty QNAP generates one
+	Enabled bool
+}
+
+// ISCSITargetUpdateInput holds mutable fields for an existing iSCSI target.
+type ISCSITargetUpdateInput struct {
+	ID      string
+	Name    string
+	Alias   string
+	Enabled bool
+}
+
+// iscsiEnsureAuth re-authenticates on port 8080 if the session looks expired,
+// then retries the operation once.
+func (c *Client) iscsiEnsureAuth() error {
+	if c.sid8080 == "" {
+		return c.login8080()
+	}
+	return nil
+}
+
+// CreateISCSITarget creates an iSCSI target via the port-8080 CGI.
+func (c *Client) CreateISCSITarget(input ISCSITargetCreateInput) (*ISCSITarget, error) {
+	if err := c.iscsiEnsureAuth(); err != nil {
+		return nil, err
+	}
+
+	q := url.Values{}
+	q.Set("prod", "qts")
+	q.Set("proto", "iscsi")
+	q.Set("target", "lio")
+	q.Set("backend", "dm")
+	q.Set("conf", "ini")
+	q.Set("func", "create_target")
+
+	body := url.Values{}
+	body.Set("targetName", input.Name)
+	body.Set("targetAlias", input.Alias)
+	if input.IQN != "" {
+		body.Set("targetIQN", input.IQN)
+	}
+	enabled := "0"
+	if input.Enabled {
+		enabled = "1"
+	}
+	body.Set("targetEnable", enabled)
+
+	data, err := c.iscsiPost(q, body)
+	if err != nil {
+		// Session may have expired — retry once
+		if rerr := c.login8080(); rerr == nil {
+			data, err = c.iscsiPost(q, body)
+		}
+		if err != nil {
+			return nil, fmt.Errorf("qnap CreateISCSITarget: %w", err)
+		}
+	}
+
+	if ec := xmlField(data, "errorcode"); ec != "" && ec != "0" {
+		return nil, fmt.Errorf("qnap CreateISCSITarget: errorcode=%s", ec)
+	}
+
+	// Fetch the newly created target by name
+	targets, err := c.ISCSITargets()
+	if err != nil {
+		return nil, fmt.Errorf("qnap CreateISCSITarget: post-create read: %w", err)
+	}
+	for _, t := range targets {
+		if t.Name == input.Name {
+			return &t, nil
+		}
+	}
+	return nil, fmt.Errorf("qnap CreateISCSITarget: target %q not found after creation", input.Name)
+}
+
+// UpdateISCSITarget updates an existing iSCSI target via the port-8080 CGI.
+func (c *Client) UpdateISCSITarget(input ISCSITargetUpdateInput) error {
+	if err := c.iscsiEnsureAuth(); err != nil {
+		return err
+	}
+
+	q := url.Values{}
+	q.Set("prod", "qts")
+	q.Set("proto", "iscsi")
+	q.Set("target", "lio")
+	q.Set("backend", "dm")
+	q.Set("conf", "ini")
+	q.Set("func", "edit_target")
+
+	body := url.Values{}
+	body.Set("targetIndex", input.ID)
+	body.Set("targetName", input.Name)
+	body.Set("targetAlias", input.Alias)
+	enabled := "0"
+	if input.Enabled {
+		enabled = "1"
+	}
+	body.Set("targetEnable", enabled)
+
+	data, err := c.iscsiPost(q, body)
+	if err != nil {
+		if rerr := c.login8080(); rerr == nil {
+			data, err = c.iscsiPost(q, body)
+		}
+		if err != nil {
+			return fmt.Errorf("qnap UpdateISCSITarget: %w", err)
+		}
+	}
+
+	if ec := xmlField(data, "errorcode"); ec != "" && ec != "0" {
+		return fmt.Errorf("qnap UpdateISCSITarget: errorcode=%s", ec)
+	}
+	return nil
+}
+
+// DeleteISCSITarget deletes an iSCSI target by its index ID.
+func (c *Client) DeleteISCSITarget(id string) error {
+	if err := c.iscsiEnsureAuth(); err != nil {
+		return err
+	}
+
+	q := url.Values{}
+	q.Set("prod", "qts")
+	q.Set("proto", "iscsi")
+	q.Set("target", "lio")
+	q.Set("backend", "dm")
+	q.Set("conf", "ini")
+	q.Set("func", "delete_target")
+
+	body := url.Values{}
+	body.Set("targetIndex", id)
+
+	data, err := c.iscsiPost(q, body)
+	if err != nil {
+		if rerr := c.login8080(); rerr == nil {
+			data, err = c.iscsiPost(q, body)
+		}
+		if err != nil {
+			return fmt.Errorf("qnap DeleteISCSITarget: %w", err)
+		}
+	}
+
+	if ec := xmlField(data, "errorcode"); ec != "" && ec != "0" {
+		return fmt.Errorf("qnap DeleteISCSITarget: errorcode=%s", ec)
+	}
+	return nil
+}
+
+// -----------------------------------------------------------------------
+// Write methods — ISCSILun
+// -----------------------------------------------------------------------
+
+// ISCSILunCreateInput holds parameters for creating an iSCSI LUN.
+type ISCSILunCreateInput struct {
+	Name      string
+	TargetID  string // target index to map LUN to
+	SizeBytes int64
+	ThinProv  bool
+	VolumeID  string // storage volume/pool path, e.g. "CACHEDEV1_DATA"
+}
+
+// ISCSILunUpdateInput holds mutable fields for an existing iSCSI LUN.
+type ISCSILunUpdateInput struct {
+	ID        string
+	Name      string
+	SizeBytes int64 // can only grow
+	Enabled   bool
+}
+
+// CreateISCSILun creates an iSCSI LUN and maps it to a target.
+func (c *Client) CreateISCSILun(input ISCSILunCreateInput) (*ISCSILun, error) {
+	if err := c.iscsiEnsureAuth(); err != nil {
+		return nil, err
+	}
+
+	q := url.Values{}
+	q.Set("prod", "qts")
+	q.Set("proto", "iscsi")
+	q.Set("target", "lio")
+	q.Set("backend", "dm")
+	q.Set("conf", "ini")
+	q.Set("func", "create_lun")
+
+	thinAlloc := "0"
+	if input.ThinProv {
+		thinAlloc = "1"
+	}
+
+	body := url.Values{}
+	body.Set("LUNName", input.Name)
+	body.Set("LUNThinAllocate", thinAlloc)
+	body.Set("LUNCapacity", strconv.FormatInt(input.SizeBytes, 10))
+	if input.VolumeID != "" {
+		body.Set("LUNLocation", "/share/"+input.VolumeID)
+	}
+	if input.TargetID != "" {
+		body.Set("targetIndex", input.TargetID)
+	}
+
+	data, err := c.iscsiPost(q, body)
+	if err != nil {
+		if rerr := c.login8080(); rerr == nil {
+			data, err = c.iscsiPost(q, body)
+		}
+		if err != nil {
+			return nil, fmt.Errorf("qnap CreateISCSILun: %w", err)
+		}
+	}
+
+	if ec := xmlField(data, "errorcode"); ec != "" && ec != "0" {
+		return nil, fmt.Errorf("qnap CreateISCSILun: errorcode=%s", ec)
+	}
+
+	// Fetch the newly created LUN by name
+	luns, err := c.ISCSILuns()
+	if err != nil {
+		return nil, fmt.Errorf("qnap CreateISCSILun: post-create read: %w", err)
+	}
+	for _, l := range luns {
+		if l.Name == input.Name {
+			return &l, nil
+		}
+	}
+	return nil, fmt.Errorf("qnap CreateISCSILun: LUN %q not found after creation", input.Name)
+}
+
+// UpdateISCSILun updates an existing iSCSI LUN (rename, resize, enable/disable).
+func (c *Client) UpdateISCSILun(input ISCSILunUpdateInput) error {
+	if err := c.iscsiEnsureAuth(); err != nil {
+		return err
+	}
+
+	q := url.Values{}
+	q.Set("prod", "qts")
+	q.Set("proto", "iscsi")
+	q.Set("target", "lio")
+	q.Set("backend", "dm")
+	q.Set("conf", "ini")
+	q.Set("func", "edit_lun")
+
+	enabled := "0"
+	if input.Enabled {
+		enabled = "1"
+	}
+
+	body := url.Values{}
+	body.Set("LUNIndex", input.ID)
+	body.Set("LUNName", input.Name)
+	body.Set("LUNEnable", enabled)
+	if input.SizeBytes > 0 {
+		body.Set("LUNCapacity", strconv.FormatInt(input.SizeBytes, 10))
+	}
+
+	data, err := c.iscsiPost(q, body)
+	if err != nil {
+		if rerr := c.login8080(); rerr == nil {
+			data, err = c.iscsiPost(q, body)
+		}
+		if err != nil {
+			return fmt.Errorf("qnap UpdateISCSILun: %w", err)
+		}
+	}
+
+	if ec := xmlField(data, "errorcode"); ec != "" && ec != "0" {
+		return fmt.Errorf("qnap UpdateISCSILun: errorcode=%s", ec)
+	}
+	return nil
+}
+
+// DeleteISCSILun deletes an iSCSI LUN by its index ID.
+func (c *Client) DeleteISCSILun(id string) error {
+	if err := c.iscsiEnsureAuth(); err != nil {
+		return err
+	}
+
+	q := url.Values{}
+	q.Set("prod", "qts")
+	q.Set("proto", "iscsi")
+	q.Set("target", "lio")
+	q.Set("backend", "dm")
+	q.Set("conf", "ini")
+	q.Set("func", "delete_lun")
+
+	body := url.Values{}
+	body.Set("LUNIndex", id)
+
+	data, err := c.iscsiPost(q, body)
+	if err != nil {
+		if rerr := c.login8080(); rerr == nil {
+			data, err = c.iscsiPost(q, body)
+		}
+		if err != nil {
+			return fmt.Errorf("qnap DeleteISCSILun: %w", err)
+		}
+	}
+
+	if ec := xmlField(data, "errorcode"); ec != "" && ec != "0" {
+		return fmt.Errorf("qnap DeleteISCSILun: errorcode=%s", ec)
+	}
+	return nil
+}
+
 // GetJSON performs a GET against an arbitrary path (kept for datasource compatibility).
 func (c *Client) GetJSON(path string, query url.Values, v interface{}) error {
 	body, err := c.cgiGet(path, query)
