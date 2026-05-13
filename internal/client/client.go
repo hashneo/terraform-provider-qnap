@@ -12,6 +12,10 @@
 //  3. Management CGI   — https://<host>/cgi-bin/management/manaRequest.cgi
 //     XML responses, SID passed as query param. Used for system info.
 //
+//  4. iSCSI CGI — http://<host>:8080/cgi-bin/disk/iscsi_portal_setting.cgi
+//     XML responses. Requires a separate SID obtained via auth on port 8080.
+//     HTTPS SIDs return errorcode -22 on this endpoint.
+//
 // Note: The /api/v2/ REST endpoints are NOT available on all QTS versions/models.
 // This client uses only the proven CGI endpoints for maximum compatibility.
 package client
@@ -54,11 +58,14 @@ const (
 
 // Client is a QNAP QTS CGI client.
 type Client struct {
-	Host       string
-	BaseURL    string
-	Username   string
-	httpClient *http.Client
-	sid        string
+	Host        string
+	BaseURL     string
+	BaseURL8080 string // http://<host>:8080 — required for iSCSI CGI
+	Username    string
+	httpClient  *http.Client
+	sid         string
+	sid8080     string // SID obtained via auth on port 8080
+	password    string // stored for lazy 8080 login
 }
 
 // New creates a new QNAP client and authenticates immediately.
@@ -69,10 +76,25 @@ func New(host, username, password string, sslInsecure bool) (*Client, error) {
 	}
 	baseURL = strings.TrimRight(baseURL, "/")
 
+	// Derive host without scheme for port-8080 URL
+	hostOnly := host
+	if strings.HasPrefix(hostOnly, "https://") {
+		hostOnly = hostOnly[8:]
+	} else if strings.HasPrefix(hostOnly, "http://") {
+		hostOnly = hostOnly[7:]
+	}
+	hostOnly = strings.TrimRight(hostOnly, "/")
+	// Strip any existing port so we can add 8080
+	if idx := strings.LastIndex(hostOnly, ":"); idx > strings.LastIndex(hostOnly, "]") {
+		hostOnly = hostOnly[:idx]
+	}
+
 	c := &Client{
-		Host:    host,
-		BaseURL: baseURL,
-		Username: username,
+		Host:        host,
+		BaseURL:     baseURL,
+		BaseURL8080: "http://" + hostOnly + ":8080",
+		Username:    username,
+		password:    password,
 		httpClient: &http.Client{
 			Timeout: 30 * time.Second,
 			Transport: &http.Transport{
@@ -115,6 +137,62 @@ func (c *Client) login(username, password string) error {
 	}
 	c.sid = sid
 	return nil
+}
+
+// login8080 authenticates on port 8080 (required for iSCSI CGI) and stores sid8080.
+func (c *Client) login8080() error {
+	encoded := base64.StdEncoding.EncodeToString([]byte(c.password))
+	endpoint := fmt.Sprintf("%s%s", c.BaseURL8080, pathLogin)
+	params := url.Values{}
+	params.Set("user", c.Username)
+	params.Set("pwd", encoded)
+	params.Set("serviceKey", "1")
+
+	resp, err := c.httpClient.PostForm(endpoint, params)
+	if err != nil {
+		return fmt.Errorf("qnap port-8080 login POST failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return fmt.Errorf("qnap port-8080 login read body: %w", err)
+	}
+
+	sid := xmlField(body, "authSid")
+	passed := xmlField(body, "authPassed")
+	if passed != "1" || sid == "" {
+		return fmt.Errorf("qnap port-8080 authentication failed (authPassed=%q)", passed)
+	}
+	c.sid8080 = sid
+	return nil
+}
+
+// iscsiPost posts to the iSCSI CGI on port 8080 with the given query params and body params.
+// Lazily authenticates on port 8080 on first call.
+func (c *Client) iscsiPost(query url.Values, body url.Values) ([]byte, error) {
+	if c.sid8080 == "" {
+		if err := c.login8080(); err != nil {
+			return nil, err
+		}
+	}
+	query.Set("sid", c.sid8080)
+	endpoint := fmt.Sprintf("%s/cgi-bin/disk/iscsi_portal_setting.cgi?%s",
+		c.BaseURL8080, query.Encode())
+
+	resp, err := c.httpClient.PostForm(endpoint, body)
+	if err != nil {
+		return nil, fmt.Errorf("qnap iSCSI POST failed: %w", err)
+	}
+	defer resp.Body.Close()
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("qnap iSCSI POST read body: %w", err)
+	}
+	if xmlField(data, "authPassed") != "1" {
+		return nil, fmt.Errorf("qnap iSCSI: not authenticated (errorcode=%s)", xmlField(data, "errorcode"))
+	}
+	return data, nil
 }
 
 // cgiGet performs a GET against a CGI endpoint with sid appended and returns the body.
@@ -280,16 +358,18 @@ type StoragePool struct {
 	SpareCount int
 }
 
-// ISCSITarget — placeholder for iSCSI targets.
+// ISCSITarget represents an iSCSI target from the QNAP iSCSI CGI API.
 type ISCSITarget struct {
-	ID      string
-	Name    string
-	IQN     string
-	Status  string
-	Enabled bool
+	ID         string
+	Name       string
+	Alias      string
+	IQN        string
+	Status     string
+	Enabled    bool
+	Initiators []string // connected initiator IQNs (deduplicated)
 }
 
-// ISCSILun — placeholder for iSCSI LUNs.
+// ISCSILun represents an iSCSI LUN from the QNAP iSCSI CGI API.
 type ISCSILun struct {
 	ID        string
 	Name      string
@@ -302,6 +382,9 @@ type ISCSILun struct {
 	ThinProv  bool
 	VolumeID  string
 	FilePath  string
+	SerialNum string
+	NAA       string
+	Enabled   bool
 }
 
 // Snapshot — placeholder for snapshots.
@@ -723,14 +806,184 @@ func (c *Client) StoragePools() ([]StoragePool, error) {
 	return []StoragePool{}, nil
 }
 
-// ISCSITargets — not available via CGI on this device; returns empty list.
+// ISCSITargets fetches iSCSI targets via the port-8080 CGI API.
 func (c *Client) ISCSITargets() ([]ISCSITarget, error) {
-	return []ISCSITarget{}, nil
+	q := url.Values{}
+	q.Set("prod", "qts")
+	q.Set("proto", "iscsi")
+	q.Set("target", "lio")
+	q.Set("backend", "dm")
+	q.Set("conf", "ini")
+	q.Set("func", "extra_get")
+	q.Set("targetList", "1")
+
+	data, err := c.iscsiPost(q, url.Values{})
+	if err != nil {
+		return nil, fmt.Errorf("qnap ISCSITargets: %w", err)
+	}
+
+	s := string(data)
+	// Extract each <targetInfo>...</targetInfo> block
+	var targets []ISCSITarget
+	const openTag = "<targetInfo>"
+	const closeTag = "</targetInfo>"
+	offset := 0
+	for {
+		start := strings.Index(s[offset:], openTag)
+		if start < 0 {
+			break
+		}
+		start += offset
+		end := strings.Index(s[start:], closeTag)
+		if end < 0 {
+			break
+		}
+		block := s[start+len(openTag) : start+end]
+		offset = start + end + len(closeTag)
+
+		idx := xmlFieldFromStr(block, "targetIndex")
+		name := xmlFieldFromStr(block, "targetName")
+		iqn := xmlFieldFromStr(block, "targetIQN")
+		alias := xmlFieldFromStr(block, "targetAlias")
+		status := xmlFieldFromStr(block, "targetStatus")
+
+		// Collect unique connected initiator IQNs
+		var initiators []string
+		seen := map[string]bool{}
+		connBlock := xmlFieldFromStr(block, "initiatorConnList")
+		connOffset := 0
+		const connOpen = "<initiatorConnInfo>"
+		const connClose = "</initiatorConnInfo>"
+		for {
+			cs := strings.Index(connBlock[connOffset:], connOpen)
+			if cs < 0 {
+				break
+			}
+			cs += connOffset
+			ce := strings.Index(connBlock[cs:], connClose)
+			if ce < 0 {
+				break
+			}
+			cb := connBlock[cs+len(connOpen) : cs+ce]
+			connOffset = cs + ce + len(connClose)
+			iqnConn := xmlFieldFromStr(cb, "initiatorIQN")
+			if iqnConn != "" && !seen[iqnConn] {
+				seen[iqnConn] = true
+				initiators = append(initiators, iqnConn)
+			}
+		}
+
+		targets = append(targets, ISCSITarget{
+			ID:         idx,
+			Name:       name,
+			IQN:        iqn,
+			Alias:      alias,
+			Status:     status,
+			Enabled:    status == "1",
+			Initiators: initiators,
+		})
+	}
+	return targets, nil
 }
 
-// ISCSILuns — not available via CGI on this device; returns empty list.
+// ISCSILuns fetches iSCSI LUNs via the port-8080 CGI API.
+// First retrieves the LUN index list, then fetches detail for each LUN.
 func (c *Client) ISCSILuns() ([]ISCSILun, error) {
-	return []ISCSILun{}, nil
+	// Step 1: get LUN index list
+	q := url.Values{}
+	q.Set("store", "lunList")
+	body := url.Values{}
+	body.Set("prod", "qts")
+	body.Set("proto", "iscsi")
+	body.Set("target", "lio")
+	body.Set("backend", "dm")
+	body.Set("conf", "ini")
+	body.Set("func", "extra_get")
+	body.Set("extra_lun_index", "1")
+
+	data, err := c.iscsiPost(q, body)
+	if err != nil {
+		return nil, fmt.Errorf("qnap ISCSILuns list: %w", err)
+	}
+
+	// Parse LUN indexes from <LUNInfo><row>...<LUNIndex>N</LUNIndex>...</row></LUNInfo>
+	var lunIndexes []string
+	s := string(data)
+	offset := 0
+	const rowOpen = "<row>"
+	const rowClose = "</row>"
+	for {
+		rs := strings.Index(s[offset:], rowOpen)
+		if rs < 0 {
+			break
+		}
+		rs += offset
+		re := strings.Index(s[rs:], rowClose)
+		if re < 0 {
+			break
+		}
+		rb := s[rs+len(rowOpen) : rs+re]
+		offset = rs + re + len(rowClose)
+		if idx := xmlFieldFromStr(rb, "LUNIndex"); idx != "" {
+			lunIndexes = append(lunIndexes, idx)
+		}
+	}
+
+	// Step 2: fetch detail for each LUN
+	var luns []ISCSILun
+	for _, lunID := range lunIndexes {
+		dq := url.Values{}
+		dq.Set("prod", "qts")
+		dq.Set("proto", "iscsi")
+		dq.Set("target", "lio")
+		dq.Set("backend", "dm")
+		dq.Set("conf", "ini")
+		dq.Set("func", "extra_get")
+		dq.Set("lun_info", "1")
+		dq.Set("lunID", lunID)
+
+		dd, err := c.iscsiPost(dq, url.Values{"lastUpdateTime": []string{"0"}})
+		if err != nil {
+			continue
+		}
+		ds := string(dd)
+
+		// Parse the first <row> block in <LUNInfo>
+		rs := strings.Index(ds, rowOpen)
+		if rs < 0 {
+			continue
+		}
+		re := strings.Index(ds[rs:], rowClose)
+		if re < 0 {
+			continue
+		}
+		rb := ds[rs+len(rowOpen) : rs+re]
+
+		capacityBytes, _ := strconv.ParseInt(xmlFieldFromStr(rb, "capacity_bytes"), 10, 64)
+		lunIdx, _ := strconv.Atoi(xmlFieldFromStr(rb, "LUNIndex"))
+		status := xmlFieldFromStr(rb, "LUNStatus")
+		enabled := xmlFieldFromStr(rb, "LUNEnable") == "1"
+		thinProv := xmlFieldFromStr(rb, "LUNThinAllocate") == "1"
+
+		// Determine target ID from LUNTargetList
+		targetIdx := xmlFieldFromStr(xmlFieldFromStr(rb, "LUNTargetList"), "targetIndex")
+
+		lun := ISCSILun{
+			ID:        lunID,
+			Name:      xmlFieldFromStr(rb, "LUNName"),
+			TargetID:  targetIdx,
+			LunID:     lunIdx,
+			SizeBytes: capacityBytes,
+			Status:    status,
+			ThinProv:  thinProv,
+			FilePath:  xmlFieldFromStr(rb, "LUNPath"),
+			SerialNum: xmlFieldFromStr(rb, "LUNSerialNum"),
+			NAA:       xmlFieldFromStr(rb, "LUNNAA"),
+			Enabled:   enabled,
+		}
+		luns = append(luns, lun)
+	}
+	return luns, nil
 }
 
 // Snapshots — not available via CGI on this device; returns empty list.
