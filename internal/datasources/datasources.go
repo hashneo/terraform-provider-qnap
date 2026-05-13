@@ -398,36 +398,105 @@ func NewSharedFoldersDataSource() datasource.DataSource {
 }
 
 // -----------------------------------------------------------------------
-// iSCSI Targets
+// iSCSI Targets — concrete datasource (initiators is a proper list(string))
 // -----------------------------------------------------------------------
 
-func NewISCSITargetsDataSource() datasource.DataSource {
-	d := &listDS{
-		typeSuffix:  "iscsi_targets",
-		description: "Lists all iSCSI targets on the QNAP NAS.",
-		fields: []listField{
-			{"id", "Target ID.", "string"},
-			{"name", "Target name.", "string"},
-			{"iqn", "iSCSI Qualified Name.", "string"},
-			{"status", "Target status.", "string"},
-			{"enabled", "Whether the target is enabled.", "bool"},
+var _ datasource.DataSource = (*ISCSITargetsDataSource)(nil)
+
+type ISCSITargetsDataSource struct{ client *client.Client }
+
+func NewISCSITargetsDataSource() datasource.DataSource { return &ISCSITargetsDataSource{} }
+
+func (d *ISCSITargetsDataSource) Metadata(_ context.Context, req datasource.MetadataRequest, resp *datasource.MetadataResponse) {
+	resp.TypeName = req.ProviderTypeName + "_iscsi_targets"
+}
+
+func (d *ISCSITargetsDataSource) Configure(_ context.Context, req datasource.ConfigureRequest, resp *datasource.ConfigureResponse) {
+	if req.ProviderData == nil {
+		return
+	}
+	c, ok := req.ProviderData.(*client.Client)
+	if !ok {
+		resp.Diagnostics.AddError("Unexpected provider data", fmt.Sprintf("Expected *client.Client, got %T", req.ProviderData))
+		return
+	}
+	d.client = c
+}
+
+func (d *ISCSITargetsDataSource) Schema(_ context.Context, _ datasource.SchemaRequest, resp *datasource.SchemaResponse) {
+	resp.Schema = schema.Schema{
+		MarkdownDescription: "Lists all iSCSI targets on the QNAP NAS, including connected initiator IQNs.",
+		Attributes: map[string]schema.Attribute{
+			"id": schema.StringAttribute{Computed: true},
+			"items": schema.ListNestedAttribute{
+				Computed: true,
+				NestedObject: schema.NestedAttributeObject{
+					Attributes: map[string]schema.Attribute{
+						"id":      schema.StringAttribute{Computed: true, MarkdownDescription: "Target index."},
+						"name":    schema.StringAttribute{Computed: true, MarkdownDescription: "Target name."},
+						"alias":   schema.StringAttribute{Computed: true, MarkdownDescription: "Target alias."},
+						"iqn":     schema.StringAttribute{Computed: true, MarkdownDescription: "iSCSI Qualified Name."},
+						"status":  schema.StringAttribute{Computed: true, MarkdownDescription: "Target status code."},
+						"enabled": schema.BoolAttribute{Computed: true, MarkdownDescription: "Whether the target is enabled."},
+						"initiators": schema.ListAttribute{
+							Computed:            true,
+							ElementType:         types.StringType,
+							MarkdownDescription: "Deduplicated list of connected initiator IQNs.",
+						},
+					},
+				},
+			},
 		},
 	}
-	d.fetchFn = func() ([]map[string]interface{}, error) {
-		items, err := d.client.ISCSITargets()
-		if err != nil {
-			return nil, err
-		}
-		rows := make([]map[string]interface{}, len(items))
-		for i, v := range items {
-			rows[i] = map[string]interface{}{
-				"id": v.ID, "name": v.Name, "iqn": v.IQN,
-				"status": v.Status, "enabled": v.Enabled,
-			}
-		}
-		return rows, nil
+}
+
+type iscsiTargetItem struct {
+	ID         types.String `tfsdk:"id"`
+	Name       types.String `tfsdk:"name"`
+	Alias      types.String `tfsdk:"alias"`
+	IQN        types.String `tfsdk:"iqn"`
+	Status     types.String `tfsdk:"status"`
+	Enabled    types.Bool   `tfsdk:"enabled"`
+	Initiators types.List   `tfsdk:"initiators"`
+}
+
+type iscsiTargetsModel struct {
+	ID    types.String `tfsdk:"id"`
+	Items []iscsiTargetItem `tfsdk:"items"`
+}
+
+func (d *ISCSITargetsDataSource) Read(ctx context.Context, _ datasource.ReadRequest, resp *datasource.ReadResponse) {
+	targets, err := d.client.ISCSITargets()
+	if err != nil {
+		resp.Diagnostics.AddError("Could not read iSCSI targets", err.Error())
+		return
 	}
-	return d
+
+	items := make([]iscsiTargetItem, 0, len(targets))
+	for _, t := range targets {
+		iqnVals := make([]attr.Value, len(t.Initiators))
+		for i, iqn := range t.Initiators {
+			iqnVals[i] = types.StringValue(iqn)
+		}
+		initiatorsList, diags := types.ListValue(types.StringType, iqnVals)
+		resp.Diagnostics.Append(diags...)
+
+		items = append(items, iscsiTargetItem{
+			ID:         types.StringValue(t.ID),
+			Name:       types.StringValue(t.Name),
+			Alias:      types.StringValue(t.Alias),
+			IQN:        types.StringValue(t.IQN),
+			Status:     types.StringValue(t.Status),
+			Enabled:    types.BoolValue(t.Enabled),
+			Initiators: initiatorsList,
+		})
+	}
+
+	state := iscsiTargetsModel{
+		ID:    types.StringValue(d.client.Host),
+		Items: items,
+	}
+	resp.Diagnostics.Append(resp.State.Set(ctx, &state)...)
 }
 
 // -----------------------------------------------------------------------
@@ -444,12 +513,13 @@ func NewISCSILunsDataSource() datasource.DataSource {
 			{"target_id", "Parent target ID.", "string"},
 			{"lun_id", "LUN number within the target.", "int64"},
 			{"size_bytes", "Provisioned size in bytes.", "int64"},
-			{"used_bytes", "Used space in bytes.", "int64"},
 			{"status", "LUN status.", "string"},
 			{"lun_type", "LUN type: File or Block.", "string"},
 			{"thin", "Thin provisioning enabled.", "bool"},
-			{"volume_id", "Host volume ID.", "string"},
-			{"file_path", "File path (for file-based LUNs).", "string"},
+			{"file_path", "Filesystem path of the LUN backing file.", "string"},
+			{"serial_num", "LUN serial number (UUID).", "string"},
+			{"naa", "NAA identifier.", "string"},
+			{"enabled", "Whether the LUN is enabled.", "bool"},
 		},
 	}
 	d.fetchFn = func() ([]map[string]interface{}, error) {
@@ -460,11 +530,18 @@ func NewISCSILunsDataSource() datasource.DataSource {
 		rows := make([]map[string]interface{}, len(items))
 		for i, v := range items {
 			rows[i] = map[string]interface{}{
-				"id": v.ID, "name": v.Name, "target_id": v.TargetID,
-				"lun_id": int64(v.LunID), "size_bytes": v.SizeBytes,
-				"used_bytes": v.UsedBytes, "status": v.Status,
-				"lun_type": v.LunType, "thin": v.ThinProv,
-				"volume_id": v.VolumeID, "file_path": v.FilePath,
+				"id":         v.ID,
+				"name":       v.Name,
+				"target_id":  v.TargetID,
+				"lun_id":     int64(v.LunID),
+				"size_bytes": v.SizeBytes,
+				"status":     v.Status,
+				"lun_type":   v.LunType,
+				"thin":       v.ThinProv,
+				"file_path":  v.FilePath,
+				"serial_num": v.SerialNum,
+				"naa":        v.NAA,
+				"enabled":    v.Enabled,
 			}
 		}
 		return rows, nil
